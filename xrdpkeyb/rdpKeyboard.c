@@ -69,6 +69,25 @@ xrdp keyboard module
 #define WM_UNICODE_INPUT 19
 #endif
 
+/*
+ * Use the default evdev F13-F24 keycodes as Unicode scratch keys. They are
+ * outside the normal PC keyboard range, and avoid the Korean/Japanese/Meta
+ * keys around 130-156 and the virtual-modifier/IME/XF86 controls above 202.
+ */
+#define XRDP_UNICODE_KEYCODE_FIRST 191
+#define XRDP_UNICODE_KEYCODE_LAST 202
+#define XRDP_UNICODE_KEYCODE_COUNT \
+    ((XRDP_UNICODE_KEYCODE_LAST - XRDP_UNICODE_KEYCODE_FIRST) + 1)
+#define XRDP_UNICODE_CACHE_EMPTY 0xffffffffU
+#define XRDP_X11_KEYCODE_COUNT 256
+
+/* xorgxrdp creates one keyboard device per Xorg server process. Keep Unicode
+ * scratch-key state private to this driver source file rather than extending
+ * rdpRec/rdpKeyboard, which is shared by multiple xorgxrdp modules. */
+static unsigned int g_unicode_codepoints[XRDP_UNICODE_KEYCODE_COUNT];
+static int g_unicode_next_index = 0;
+static unsigned char g_modifier_key_down[XRDP_X11_KEYCODE_COUNT];
+
 static char g_evdev_str[] = "evdev";
 static char g_pc104_str[] = "pc104";
 static char g_us_str[] = "us";
@@ -93,15 +112,16 @@ unicode_keycode_reserved(int keycode)
      * state into committed Unicode text. */
     switch (keycode)
     {
-        case 134: /* Brazilian keypad . */
-        case 156: /* meta keys */
-        case 211: /* Brazilian / ? */
+        case 133: /* LWIN / Mod4 */
+        case 134: /* RWIN / Mod4 */
+        case 156: /* program/meta keys */
             return 1;
     }
 
-    if (keycode >= 208 && keycode <= 217)
+    if (keycode >= 203 && keycode <= 217)
     {
-        /* IME and XF86 keyboard-control keys on the default XKB map */
+        /* Virtual modifiers, IME and XF86 keyboard-control keys on the default
+         * XKB map. Reusing them can leak modifier state into Unicode text. */
         return 1;
     }
 
@@ -112,9 +132,21 @@ unicode_keycode_reserved(int keycode)
 static void
 rdpUnicodeReset(rdpKeyboard *keyboard)
 {
-    memset(keyboard->unicode_codepoints, 0,
-           sizeof(keyboard->unicode_codepoints));
-    keyboard->unicode_next_index = 0;
+    int index;
+
+    (void)keyboard;
+    for (index = 0; index < XRDP_UNICODE_KEYCODE_COUNT; ++index)
+    {
+        g_unicode_codepoints[index] = XRDP_UNICODE_CACHE_EMPTY;
+    }
+    g_unicode_next_index = 0;
+}
+
+/******************************************************************************/
+static void
+rdpModifierReset(void)
+{
+    memset(g_modifier_key_down, 0, sizeof(g_modifier_key_down));
 }
 
 /******************************************************************************/
@@ -237,30 +269,31 @@ rdpUnicodeFindKeycode(rdpKeyboard *keyboard, unsigned int unicode)
     int keycode;
     int attempts;
 
-    /* Reuse an existing scratch keycode for repeated characters. This keeps
-     * mobile keyboard repeats and pasted runs from constantly changing XKB. */
-    for (index = 0; index < XRDP_UNICODE_KEYCODE_COUNT; ++index)
-    {
-        keycode = XRDP_UNICODE_KEYCODE_FIRST + index;
-        if (!unicode_keycode_reserved(keycode) &&
-                keyboard->unicode_codepoints[index] == unicode)
-        {
-            return keycode;
-        }
-    }
-
     keysym = unicode_to_keysym(unicode);
     if (keysym == NoSymbol)
     {
         return 0;
     }
 
+    /* Reuse an existing scratch keycode for repeated characters. This keeps
+     * mobile keyboard repeats and pasted runs from constantly changing XKB.
+     * Validate first so U+0000 cannot match the empty cache sentinel. */
+    for (index = 0; index < XRDP_UNICODE_KEYCODE_COUNT; ++index)
+    {
+        keycode = XRDP_UNICODE_KEYCODE_FIRST + index;
+        if (!unicode_keycode_reserved(keycode) &&
+                g_unicode_codepoints[index] == unicode)
+        {
+            return keycode;
+        }
+    }
+
     for (attempts = 0; attempts < XRDP_UNICODE_KEYCODE_COUNT; ++attempts)
     {
-        index = keyboard->unicode_next_index++;
-        if (keyboard->unicode_next_index >= XRDP_UNICODE_KEYCODE_COUNT)
+        index = g_unicode_next_index++;
+        if (g_unicode_next_index >= XRDP_UNICODE_KEYCODE_COUNT)
         {
-            keyboard->unicode_next_index = 0;
+            g_unicode_next_index = 0;
         }
 
         keycode = XRDP_UNICODE_KEYCODE_FIRST + index;
@@ -273,7 +306,7 @@ rdpUnicodeFindKeycode(rdpKeyboard *keyboard, unsigned int unicode)
          * small ring and post a normal key press/release for that keycode. */
         if (rdpUnicodeSetKeySym(keyboard->device, keycode, keysym) == 0)
         {
-            keyboard->unicode_codepoints[index] = unicode;
+            g_unicode_codepoints[index] = unicode;
             return keycode;
         }
     }
@@ -316,26 +349,52 @@ sendDownUpKeyEvent(DeviceIntPtr device, int type, int x_scancode)
 static void
 check_keysa(rdpKeyboard *keyboard)
 {
-    if (keyboard->ctrl_down != 0)
-    {
-        rdpEnqueueKey(keyboard->device, KeyRelease, keyboard->ctrl_down);
-        keyboard->ctrl_down = 0;
-    }
-
-    if (keyboard->alt_down != 0)
-    {
-        rdpEnqueueKey(keyboard->device, KeyRelease, keyboard->alt_down);
-        keyboard->alt_down = 0;
-    }
-
-    if (keyboard->shift_down != 0)
-    {
-        rdpEnqueueKey(keyboard->device, KeyRelease, keyboard->shift_down);
-        keyboard->shift_down = 0;
-    }
-
     // Terminate any pause sequence in progress
     keyboard->skip_numlock = 0;
+}
+
+/******************************************************************************/
+static void
+track_modifier_key(int keycode, int down)
+{
+    if (keycode > 0 && keycode < XRDP_X11_KEYCODE_COUNT)
+    {
+        g_modifier_key_down[keycode] = down ? 1 : 0;
+    }
+}
+
+/******************************************************************************/
+static void
+unicode_release_tracked_modifiers(DeviceIntPtr device,
+                                  unsigned char *released_modifiers)
+{
+    int keycode;
+
+    memset(released_modifiers, 0, XRDP_X11_KEYCODE_COUNT);
+    for (keycode = 0; keycode < XRDP_X11_KEYCODE_COUNT; ++keycode)
+    {
+        if (g_modifier_key_down[keycode])
+        {
+            released_modifiers[keycode] = 1;
+            rdpEnqueueKey(device, KeyRelease, keycode);
+        }
+    }
+}
+
+/******************************************************************************/
+static void
+unicode_restore_tracked_modifiers(DeviceIntPtr device,
+                                  const unsigned char *released_modifiers)
+{
+    int keycode;
+
+    for (keycode = 0; keycode < XRDP_X11_KEYCODE_COUNT; ++keycode)
+    {
+        if (released_modifiers[keycode] && g_modifier_key_down[keycode])
+        {
+            rdpEnqueueKey(device, KeyPress, keycode);
+        }
+    }
 }
 
 /**
@@ -383,26 +442,30 @@ KbdAddEvent(rdpKeyboard *keyboard, int down, int param1, int param2,
          * pass these on to the X server to make sense of them */
         case SCANCODE_LSHIFT_KEY:
         case SCANCODE_RSHIFT_KEY:
-            keyboard->shift_down = down ? x_keycode : 0;
+            track_modifier_key(x_keycode, down);
             rdpEnqueueKey(keyboard->device, type, x_keycode);
             break;
 
         case SCANCODE_LCTRL_KEY:
         case SCANCODE_RCTRL_KEY:
-            keyboard->ctrl_down = down ? x_keycode : 0;
+            track_modifier_key(x_keycode, down);
             rdpEnqueueKey(keyboard->device, type, x_keycode);
             break;
 
         case SCANCODE_LALT_KEY:
         case SCANCODE_RALT_KEY:
-            keyboard->alt_down = down ? x_keycode : 0;
+            track_modifier_key(x_keycode, down);
+            rdpEnqueueKey(keyboard->device, type, x_keycode);
+            break;
+
+        case SCANCODE_LWIN_KEY:
+        case SCANCODE_RWIN_KEY:
+            track_modifier_key(x_keycode, down);
             rdpEnqueueKey(keyboard->device, type, x_keycode);
             break;
 
         case SCANCODE_CAPS_KEY:
         case SCANCODE_NUMLOCK_KEY:
-        case SCANCODE_LWIN_KEY:
-        case SCANCODE_RWIN_KEY:
         case SCANCODE_MENU_KEY:
             rdpEnqueueKey(keyboard->device, type, x_keycode);
             break;
@@ -520,16 +583,29 @@ KbdSync(rdpKeyboard *keyboard, int param1)
 static void
 KbdUnicodeEvent(rdpKeyboard *keyboard, unsigned int unicode)
 {
+    unsigned char released_modifiers[XRDP_X11_KEYCODE_COUNT];
     int x_keycode;
     int needs_shift;
 
     x_keycode = rdpUnicodeFindKeycode(keyboard, unicode);
     if (x_keycode > 0)
     {
-        /* Release tracked physical modifiers first so Unicode commits are
-         * literal text, not Ctrl/Alt/Shift shortcuts. ASCII letter case is then
-         * restored explicitly with a temporary Shift when required. */
-        check_keysa(keyboard);
+        /* Perform deferred synchronization on the first keyboard interaction,
+         * even if that interaction arrives as RDP Unicode input rather than as
+         * a physical scancode keypress. */
+        if (!g_initial_sync_completed)
+        {
+            g_initial_sync_completed = 1;
+            LOG(LOG_LEVEL_DEBUG,
+                "KbdUnicodeEvent: First Unicode input, enforcing deferred sync");
+            KbdSync(keyboard, g_deferred_sync_flags);
+        }
+
+        /* Temporarily release tracked physical modifiers so Unicode commits are
+         * literal text, not Ctrl/Alt/Super shortcuts. Restore the modifiers
+         * afterwards if the RDP client still has them physically down. */
+        keyboard->skip_numlock = 0;
+        unicode_release_tracked_modifiers(keyboard->device, released_modifiers);
         needs_shift = unicode_ascii_letter_needs_shift(keyboard, unicode);
         if (needs_shift)
         {
@@ -541,6 +617,7 @@ KbdUnicodeEvent(rdpKeyboard *keyboard, unsigned int unicode)
         {
             rdpEnqueueKey(keyboard->device, KeyRelease, SHIFT_L_KEY_CODE);
         }
+        unicode_restore_tracked_modifiers(keyboard->device, released_modifiers);
     }
 }
 
@@ -564,6 +641,7 @@ rdpInputKeyboard(rdpPtr dev, int msg, long param1, long param2,
             break;
         case 18:
             rdpUnicodeReset(keyboard);
+            rdpModifierReset();
             rdpLoadLayout(keyboard, (struct xup_client_info *) param1);
             break;
         case WM_UNICODE_INPUT:
@@ -681,6 +759,7 @@ rdpkeybControl(DeviceIntPtr device, int what)
             dev->keyboard.device = device;
             rdpLoadLayout(&(dev->keyboard), NULL);
             rdpUnicodeReset(&(dev->keyboard));
+            rdpModifierReset();
             rdpRegisterInputCallback(0, rdpInputKeyboard);
             break;
         case DEVICE_ON:
