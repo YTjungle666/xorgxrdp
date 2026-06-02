@@ -692,13 +692,21 @@ rdpClientConRecvMsg(rdpPtr dev, rdpClientCon *clientCon)
             s->end = s->data + 4;
             in_uint32_le(s, len);
 
-            if (len > 3)
+            if ((len < 6) || (len > MAX_OS_BYTES))
+            {
+                LOG(LOG_LEVEL_INFO,
+                    "rdpClientConRecvMsg: bad XUP message length %d", len);
+                rv = 1;
+            }
+            else
             {
                 init_stream(s, len);
                 rv = rdpClientConRecv(dev, clientCon, s->data, len - 4);
                 if (rv == 0)
                 {
-                    s->end = s->data + len;
+                    /* The 32-bit length includes the length field itself.
+                     * Only len - 4 payload bytes were read into s->data. */
+                    s->end = s->data + (len - 4);
                 }
             }
         }
@@ -1043,8 +1051,16 @@ rdpClientConProcessMsgClientInput(rdpPtr dev, rdpClientCon *clientCon)
     int y;
     int cx;
     int cy;
+    int monitors_bytes;
+    char *utf8_text;
 
     s = clientCon->in_s;
+    if (s->end - s->p < 20)
+    {
+        LOG(LOG_LEVEL_INFO,
+            "rdpClientConProcessMsgClientInput: short input message");
+        return 1;
+    }
     in_uint32_le(s, msg);
     in_uint32_le(s, param1);
     in_uint32_le(s, param2);
@@ -1055,7 +1071,22 @@ rdpClientConProcessMsgClientInput(rdpPtr dev, rdpClientCon *clientCon)
         "rdpClientConProcessMsgClientInput: msg %d param1 %d param2 %d "
         "param3 %d param4 %d", msg, param1, param2, param3, param4);
 
-    if (msg < 100)
+    if (msg == WM_UNICODE_TEXT_INPUT)
+    {
+        if (param1 <= 0 || param1 > XRDP_UNICODE_TEXT_INPUT_MAX_BYTES ||
+                s->end - s->p != param1)
+        {
+            LOG(LOG_LEVEL_INFO,
+                "rdpClientConProcessMsgClientInput: bad Unicode UTF-8 payload length %d remaining %d",
+                param1, (int)(s->end - s->p));
+            return 1;
+        }
+        utf8_text = g_new0(char, param1 + 1);
+        in_uint8a(s, utf8_text, param1);
+        rdpInputKeyboardEvent(dev, msg, (long)utf8_text, param1, 0, 0);
+        free(utf8_text);
+    }
+    else if (msg < 100)
     {
         rdpInputKeyboardEvent(dev, msg, param1, param2, param3, param4);
     }
@@ -1086,10 +1117,19 @@ rdpClientConProcessMsgClientInput(rdpPtr dev, rdpClientCon *clientCon)
     }
     else if (msg == 302) /* monitor update */
     {
-        if (param3 > 0 && param3 < CLIENT_MONITOR_DATA_MAXIMUM_MONITORS)
+        if (param3 > 0 && param3 < CLIENT_MONITOR_DATA_MAXIMUM_MONITORS &&
+                param3 <= INT_MAX / (int)sizeof(struct monitor_info))
         {
             struct monitor_info monitors[CLIENT_MONITOR_DATA_MAXIMUM_MONITORS];
-            in_uint8a(s, monitors, param3 * sizeof(monitors[0]));
+            monitors_bytes = param3 * (int)sizeof(monitors[0]);
+            if (s->end - s->p < monitors_bytes)
+            {
+                LOG(LOG_LEVEL_INFO,
+                    "rdpClientConProcessMsgClientInput: short monitor payload %d remaining %d",
+                    monitors_bytes, (int)(s->end - s->p));
+                return 1;
+            }
+            in_uint8a(s, monitors, monitors_bytes);
 
             rdpClientConProcessMonitorUpdateMsg(dev, clientCon,
                                                 param1, param2, param3,
@@ -1602,28 +1642,35 @@ static int
 rdpClientConProcessMsg(rdpPtr dev, rdpClientCon *clientCon)
 {
     int msg_type;
+    int rv;
     struct stream *s;
 
     LOG(LOG_LEVEL_TRACE, "rdpClientConProcessMsg:");
     s = clientCon->in_s;
+    if (s->end - s->p < 2)
+    {
+        LOG(LOG_LEVEL_INFO, "rdpClientConProcessMsg: short message");
+        return 1;
+    }
     in_uint16_le(s, msg_type);
     LOG(LOG_LEVEL_TRACE, "rdpClientConProcessMsg: msg_type %d", msg_type);
+    rv = 0;
     switch (msg_type)
     {
         case 103: /* client input */
-            rdpClientConProcessMsgClientInput(dev, clientCon);
+            rv = rdpClientConProcessMsgClientInput(dev, clientCon);
             break;
         case 104: /* client info */
-            rdpClientConProcessMsgClientInfo(dev, clientCon);
+            rv = rdpClientConProcessMsgClientInfo(dev, clientCon);
             break;
         case 105: /* client region */
-            rdpClientConProcessMsgClientRegion(dev, clientCon);
+            rv = rdpClientConProcessMsgClientRegion(dev, clientCon);
             break;
         case 106: /* client region ex */
-            rdpClientConProcessMsgClientRegionEx(dev, clientCon);
+            rv = rdpClientConProcessMsgClientRegionEx(dev, clientCon);
             break;
         case 108: /* client suppress output */
-            rdpClientConProcessMsgClientSuppressOutput(dev, clientCon);
+            rv = rdpClientConProcessMsgClientSuppressOutput(dev, clientCon);
             break;
         default:
             LOG(LOG_LEVEL_INFO, "rdpClientConProcessMsg: unknown msg_type %d",
@@ -1631,7 +1678,7 @@ rdpClientConProcessMsg(rdpPtr dev, rdpClientCon *clientCon)
             break;
     }
 
-    return 0;
+    return rv;
 }
 
 /******************************************************************************/

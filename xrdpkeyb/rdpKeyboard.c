@@ -177,6 +177,82 @@ unicode_to_keysym(unsigned int unicode)
     return (unicode < 0x100) ? unicode : (0x01000000 | unicode);
 }
 
+/*****************************************************************************/
+static int
+utf8_text_get_char(const char **utf8_text, int *utf8_text_len,
+                   unsigned int *unicode)
+{
+    const unsigned char *text;
+    int len;
+    int used;
+
+    text = (const unsigned char *)*utf8_text;
+    len = *utf8_text_len;
+    if (len <= 0 || unicode == NULL)
+    {
+        return 1;
+    }
+
+    used = 0;
+    if (text[0] < 0x80)
+    {
+        *unicode = text[0];
+        used = 1;
+    }
+    else if ((text[0] & 0xe0) == 0xc0 && len >= 2 &&
+             (text[1] & 0xc0) == 0x80)
+    {
+        *unicode = ((text[0] & 0x1f) << 6) | (text[1] & 0x3f);
+        used = 2;
+        if (*unicode < 0x80)
+        {
+            return 1;
+        }
+    }
+    else if ((text[0] & 0xf0) == 0xe0 && len >= 3 &&
+             (text[1] & 0xc0) == 0x80 &&
+             (text[2] & 0xc0) == 0x80)
+    {
+        *unicode = ((text[0] & 0x0f) << 12) |
+                   ((text[1] & 0x3f) << 6) |
+                   (text[2] & 0x3f);
+        used = 3;
+        if (*unicode < 0x800 ||
+                (*unicode >= 0xd800 && *unicode <= 0xdfff))
+        {
+            return 1;
+        }
+    }
+    else if ((text[0] & 0xf8) == 0xf0 && len >= 4 &&
+             (text[1] & 0xc0) == 0x80 &&
+             (text[2] & 0xc0) == 0x80 &&
+             (text[3] & 0xc0) == 0x80)
+    {
+        *unicode = ((text[0] & 0x07) << 18) |
+                   ((text[1] & 0x3f) << 12) |
+                   ((text[2] & 0x3f) << 6) |
+                   (text[3] & 0x3f);
+        used = 4;
+        if (*unicode < 0x10000 || *unicode > 0x10ffff)
+        {
+            return 1;
+        }
+    }
+    else
+    {
+        return 1;
+    }
+
+    if (*unicode == 0)
+    {
+        return 1;
+    }
+
+    *utf8_text += used;
+    *utf8_text_len -= used;
+    return 0;
+}
+
 /******************************************************************************/
 static int
 unicode_ascii_letter_needs_shift(rdpKeyboard *keyboard, unsigned int unicode)
@@ -581,44 +657,107 @@ KbdSync(rdpKeyboard *keyboard, int param1)
 
 /******************************************************************************/
 static void
+KbdUnicodeEnsureSync(rdpKeyboard *keyboard, const char *source)
+{
+    /* Perform deferred synchronization on the first keyboard interaction,
+     * even if that interaction arrives as RDP Unicode input rather than as
+     * a physical scancode keypress. */
+    if (!g_initial_sync_completed)
+    {
+        g_initial_sync_completed = 1;
+        LOG(LOG_LEVEL_DEBUG,
+            "%s: First Unicode input, enforcing deferred sync", source);
+        KbdSync(keyboard, g_deferred_sync_flags);
+    }
+}
+
+/******************************************************************************/
+static void
+KbdUnicodePostKeycode(rdpKeyboard *keyboard, unsigned int unicode, int x_keycode)
+{
+    int needs_shift;
+
+    needs_shift = unicode_ascii_letter_needs_shift(keyboard, unicode);
+    if (needs_shift)
+    {
+        rdpEnqueueKey(keyboard->device, KeyPress, SHIFT_L_KEY_CODE);
+    }
+    rdpEnqueueKey(keyboard->device, KeyPress, x_keycode);
+    rdpEnqueueKey(keyboard->device, KeyRelease, x_keycode);
+    if (needs_shift)
+    {
+        rdpEnqueueKey(keyboard->device, KeyRelease, SHIFT_L_KEY_CODE);
+    }
+}
+
+/******************************************************************************/
+static void
 KbdUnicodeEvent(rdpKeyboard *keyboard, unsigned int unicode)
 {
     unsigned char released_modifiers[XRDP_X11_KEYCODE_COUNT];
     int x_keycode;
-    int needs_shift;
 
     x_keycode = rdpUnicodeFindKeycode(keyboard, unicode);
     if (x_keycode > 0)
     {
-        /* Perform deferred synchronization on the first keyboard interaction,
-         * even if that interaction arrives as RDP Unicode input rather than as
-         * a physical scancode keypress. */
-        if (!g_initial_sync_completed)
-        {
-            g_initial_sync_completed = 1;
-            LOG(LOG_LEVEL_DEBUG,
-                "KbdUnicodeEvent: First Unicode input, enforcing deferred sync");
-            KbdSync(keyboard, g_deferred_sync_flags);
-        }
+        KbdUnicodeEnsureSync(keyboard, "KbdUnicodeEvent");
 
         /* Temporarily release tracked physical modifiers so Unicode commits are
          * literal text, not Ctrl/Alt/Super shortcuts. Restore the modifiers
          * afterwards if the RDP client still has them physically down. */
         keyboard->skip_numlock = 0;
         unicode_release_tracked_modifiers(keyboard->device, released_modifiers);
-        needs_shift = unicode_ascii_letter_needs_shift(keyboard, unicode);
-        if (needs_shift)
-        {
-            rdpEnqueueKey(keyboard->device, KeyPress, SHIFT_L_KEY_CODE);
-        }
-        rdpEnqueueKey(keyboard->device, KeyPress, x_keycode);
-        rdpEnqueueKey(keyboard->device, KeyRelease, x_keycode);
-        if (needs_shift)
-        {
-            rdpEnqueueKey(keyboard->device, KeyRelease, SHIFT_L_KEY_CODE);
-        }
+        KbdUnicodePostKeycode(keyboard, unicode, x_keycode);
         unicode_restore_tracked_modifiers(keyboard->device, released_modifiers);
     }
+}
+
+/******************************************************************************/
+static void
+KbdUnicodeTextEvent(rdpKeyboard *keyboard, const char *utf8_text,
+                    int utf8_text_len)
+{
+    unsigned char released_modifiers[XRDP_X11_KEYCODE_COUNT];
+    const char *scan_text;
+    int scan_text_len;
+    unsigned int unicode;
+    int x_keycode;
+
+    if (utf8_text == NULL || utf8_text_len <= 0 ||
+            utf8_text_len > XRDP_UNICODE_TEXT_INPUT_MAX_BYTES)
+    {
+        return;
+    }
+
+    /* Validate the whole UTF-8 payload before injecting any part of it. */
+    scan_text = utf8_text;
+    scan_text_len = utf8_text_len;
+    while (scan_text_len > 0)
+    {
+        if (utf8_text_get_char(&scan_text, &scan_text_len, &unicode) != 0)
+        {
+            LOG(LOG_LEVEL_INFO,
+                "KbdUnicodeTextEvent: rejected malformed UTF-8 payload");
+            return;
+        }
+    }
+
+    KbdUnicodeEnsureSync(keyboard, "KbdUnicodeTextEvent");
+    keyboard->skip_numlock = 0;
+    unicode_release_tracked_modifiers(keyboard->device, released_modifiers);
+    while (utf8_text_len > 0)
+    {
+        if (utf8_text_get_char(&utf8_text, &utf8_text_len, &unicode) != 0)
+        {
+            break;
+        }
+        x_keycode = rdpUnicodeFindKeycode(keyboard, unicode);
+        if (x_keycode > 0)
+        {
+            KbdUnicodePostKeycode(keyboard, unicode, x_keycode);
+        }
+    }
+    unicode_restore_tracked_modifiers(keyboard->device, released_modifiers);
 }
 
 /******************************************************************************/
@@ -646,6 +785,9 @@ rdpInputKeyboard(rdpPtr dev, int msg, long param1, long param2,
             break;
         case WM_UNICODE_INPUT:
             KbdUnicodeEvent(keyboard, (unsigned int) param1);
+            break;
+        case WM_UNICODE_TEXT_INPUT:
+            KbdUnicodeTextEvent(keyboard, (const char *) param1, param2);
             break;
 
     }

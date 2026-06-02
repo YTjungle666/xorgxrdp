@@ -27,6 +27,21 @@ input
 #include <xorg-server.h>
 #include <xorgVersion.h>
 #include <xf86.h>
+#include "rdp.h"
+
+#ifndef WM_UNICODE_INPUT
+/* Legacy numeric codepoint backend Unicode input. */
+#define WM_UNICODE_INPUT 19
+#endif
+
+#ifndef WM_UNICODE_TEXT_INPUT
+/* UTF-8 text-payload backend Unicode input. */
+#define WM_UNICODE_TEXT_INPUT 20
+#endif
+
+#ifndef XRDP_UNICODE_TEXT_INPUT_MAX_BYTES
+#define XRDP_UNICODE_TEXT_INPUT_MAX_BYTES 4096
+#endif
 
 typedef int (*rdpInputEventProcPtr)(rdpPtr dev, int msg,
                                     long param1, long param2,
